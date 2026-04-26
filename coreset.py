@@ -213,11 +213,11 @@ class KernelHerdingBuilder:
         verbose: bool = False,
         **kwargs # Catch leftover GDBuilder args like patience
     ):
-        # 1. Collect a large pool of discrete candidate pixels from the stream
+        # 1. Collect a large pool of discrete candidate points from the stream
         candidates = []
         collected = 0
         if verbose:
-            print(f"Collecting {candidate_pool_size} candidate pixels...")
+            print(f"Collecting {candidate_pool_size} candidate points ...")
 
         while collected < candidate_pool_size:
             batch = next(data_stream)
