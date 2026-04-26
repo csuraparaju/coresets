@@ -14,7 +14,7 @@ Typical usage
     from coreset import GDBuilder
 
     kernel = RBFKernel(sigma=0.5)
-    builder = GDBuilder(kernel, steps=1000, learning_rate=0.01)
+    builder = GDBuilder(kernel, steps=1000, lr_x=0.01, lr_w=0.5)
 
     # data_stream is any iterator that yields (batch_size, d) tensors
     coreset, mmd_history = builder.build(data_stream, n=50, dim=2, verbose=True)
@@ -87,7 +87,8 @@ class GDBuilder:
         self,
         kernel: Kernel,
         steps: int = 2000,
-        learning_rate: float = 0.05,
+        lr_x: float = 0.01,
+        lr_w: float = 0.5,
         device: torch.device = None,
     ):
         """
@@ -98,15 +99,16 @@ class GDBuilder:
             steps:         Maximum number of gradient steps to take.
                            Actual steps may be fewer if early stopping triggers.
                            Defaults to 2000.
-            learning_rate: Adam learning rate applied to both point locations
-                           and weight logits. Defaults to 0.05.
+            lr_x:          Adam learning rate applied to point locations. Defaults to 0.01.
+            lr_w:          Adam learning rate applied to weights. Defaults to 0.5.
             device:        torch.device on which tensors are allocated
                            (e.g. torch.device('cuda')). Defaults to None,
                            which uses the PyTorch default.
         """
         self.kernel = kernel
         self.steps = steps
-        self.learning_rate = learning_rate
+        self.lr_x = lr_x
+        self.lr_w = lr_w
         self.device = device
 
     def build(
@@ -152,14 +154,16 @@ class GDBuilder:
         x_nd = nn.Parameter(torch.rand((n, dim), device=self.device))
         w_logits_n = nn.Parameter(torch.zeros(n, device=self.device))
 
-        optimizer = optim.Adam([x_nd, w_logits_n], lr=self.learning_rate)
+        optimizer = optim.Adam([
+            {'params': [x_nd], 'lr': self.lr_x},
+            {'params': [w_logits_n], 'lr': self.lr_w}
+        ])
 
         mmd_history = []
-
         best_ema_mmd = float('inf')
         no_improve_steps = 0
         ema_mmd = None
-        ema_alpha = 0.05  # smoothing factor for the EMA loss tracker
+        ema_alpha = 0.05
 
         step_iterator = tqdm(range(self.steps), desc="Optimizing MMD") if verbose else range(self.steps)
 
@@ -167,14 +171,12 @@ class GDBuilder:
             z_batch_bd = next(data_stream)
 
             optimizer.zero_grad()
-
             mmd = stochastic_mmd(self.kernel, x_nd, w_logits_n, z_batch_bd)
             mmd.backward()
             optimizer.step()
 
             mmd_val = mmd.item()
             mmd_history.append(mmd_val)
-
             ema_mmd = ema_alpha * mmd_val + (1 - ema_alpha) * ema_mmd if ema_mmd else mmd_val
 
             if verbose:
@@ -196,3 +198,81 @@ class GDBuilder:
 
         return Coreset(points_nd=x_nd.detach(), weights_n=w_n), mmd_history
 
+
+class KernelHerdingBuilder:
+    def __init__(self, kernel, device=torch.device('cpu')):
+        self.kernel = kernel
+        self.device = device
+
+    def build(
+        self,
+        data_stream,
+        n: int,
+        dim: int,
+        candidate_pool_size: int = 25000,
+        verbose: bool = False,
+        **kwargs # Catch leftover GDBuilder args like patience
+    ):
+        # 1. Collect a large pool of discrete candidate pixels from the stream
+        candidates = []
+        collected = 0
+        if verbose:
+            print(f"Collecting {candidate_pool_size} candidate pixels...")
+
+        while collected < candidate_pool_size:
+            batch = next(data_stream)
+            candidates.append(batch)
+            collected += batch.shape[0]
+
+        candidates = torch.cat(candidates, dim=0)[:candidate_pool_size].to(self.device)
+
+        # 2. Approximate the target distribution's kernel mean mu(x)
+        # We do this by pulling fresh batches from the image and averaging the kernel
+        if verbose:
+            print("Approximating target kernel mean...")
+
+        target_mean = torch.zeros(candidate_pool_size, device=self.device)
+        n_mean_batches = 20  # Average over a few batches for a stable approximation
+
+        with torch.no_grad():
+            for _ in range(n_mean_batches):
+                z_batch = next(data_stream).to(self.device)
+
+                # Compute in chunks to prevent MPS/CUDA Out-Of-Memory errors
+                chunk_size = 5000
+                for i in range(0, candidate_pool_size, chunk_size):
+                    chunk = candidates[i:i+chunk_size]
+                    k_mat = self.kernel.gram(chunk, z_batch)
+                    target_mean[i:i+chunk_size] += k_mat.mean(dim=1)
+
+            target_mean /= n_mean_batches
+
+        # 3. Execute the greedy Kernel Herding loop
+        selected_indices = []
+        running_penalty = torch.zeros(candidate_pool_size, device=self.device)
+
+        iterator = tqdm(range(n), desc="Kernel Herding") if verbose else range(n)
+
+        with torch.no_grad():
+            for t in iterator:
+                if t == 0:
+                    scores = target_mean
+                else:
+                    # Score = target_mean - average kernel similarity to already picked points
+                    scores = target_mean - (running_penalty / t)
+
+                # Greedily pick the candidate with the highest score
+                best_idx = torch.argmax(scores).item()
+                selected_indices.append(best_idx)
+
+                # Update the running penalty for the next iteration
+                best_point = candidates[best_idx:best_idx+1]
+                new_penalty = self.kernel.gram(candidates, best_point).squeeze(1)
+                running_penalty += new_penalty
+
+        selected_points = candidates[selected_indices]
+
+        # Kernel Herding implicitly assumes uniform weights
+        weights = torch.ones(n, device=self.device) / n
+
+        return Coreset(selected_points, weights), []
